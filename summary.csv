@@ -1,0 +1,8 @@
+,Estimate,Std_Error,Z_value,P_value,Odds_Ratio
+(Intercept),10.568,0.172,61.44,0,38860.158
+capacity_total,0,0,8.664,0,1
+total_crime,0.005,0.003,1.694,0.09,1.005
+cpi_all,-0.071,0.001,-77.68,0,0.931
+unemployment_rate,0.085,0.005,18.346,0,1.089
+min_temp_celsius,0.004,0,8.163,0,1.004
+precip_cm,0.014,0.008,1.77,0.077,1.014

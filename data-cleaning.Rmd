@@ -1,0 +1,327 @@
+---
+title: "Homeless Shelter Logistic Regression"
+author: "Sarah Rameez"
+date: "2024-11-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load the Libraries
+```{r}
+library(opendatatoronto)
+library(dplyr)
+library(tidyr)
+library(tidyverse)
+library(ggplot2)
+library(lubridate)
+library(stringr)
+```
+
+
+## Download Homeless Shelter Data for 2024 (updated daily)
+```{r}
+# get package
+package <- show_package("21c83b32-d5a8-4106-a54f-010dbe49f6f2")
+package
+ 
+# get all resources for this package
+resources <- list_package_resources("21c83b32-d5a8-4106-a54f-010dbe49f6f2")
+ 
+# identify datastore resources; by default, Toronto Open Data sets datastore resource format to CSV for non-geospatial and GeoJSON for geospatial resources
+datastore_resources <- filter(resources, tolower(format) %in% c('csv', 'geojson'))
+ 
+# load the first datastore resource as a sample
+shelter_occupancy_2024 <- filter(datastore_resources, row_number()==1) %>% get_resource()
+shelter_occupancy_2024
+```
+
+Now, we will load the datasets from 2021-2024. This data is not expected to change, so we are loading pre-downloaded .csv files
+```{r}
+shelter_occupancy_2023 <- read_csv('raw-data/daily-shelter-overnight-service-occupancy-capacity-2023.csv')
+shelter_occupancy_2022 <- read_csv('raw-data/daily-shelter-overnight-service-occupancy-capacity-2022.csv')
+shelter_occupancy_2021 <- read_csv('raw-data/daily-shelter-overnight-service-occupancy-capacity-2021.csv')
+```
+
+### Merge all DataFrames together
+
+In order to merge, first we will convert the class of each column to character, except for datetime which we will convert to datetime for each df
+
+```{r}
+shelter_occupancy_2021$OCCUPANCY_DATE <- ymd(shelter_occupancy_2021$OCCUPANCY_DATE)
+sapply(shelter_occupancy_2021, class)
+```
+
+
+```{r}
+shelter_occupancy_2022$OCCUPANCY_DATE <- ymd(shelter_occupancy_2022$OCCUPANCY_DATE)
+sapply(shelter_occupancy_2022, class)
+```
+
+
+```{r}
+shelter_occupancy_2023$OCCUPANCY_DATE <- ymd(shelter_occupancy_2023$OCCUPANCY_DATE)
+sapply(shelter_occupancy_2023, class)
+```
+
+```{r}
+shelter_occupancy_2024$OCCUPANCY_DATE <- ymd(shelter_occupancy_2024$OCCUPANCY_DATE)
+sapply(shelter_occupancy_2024, class)
+```
+
+
+```{r}
+shelter_list <- list(shelter_occupancy_2021, shelter_occupancy_2022, shelter_occupancy_2023, shelter_occupancy_2024)
+
+exclude_column <- "OCCUPANCY_DATE"
+
+# Convert each column of each dataframe to character
+shelter_list <- lapply(shelter_list, function(df) {
+  df[setdiff(names(df), exclude_column)] <- lapply(df[setdiff(names(df), exclude_column)], as.character)
+  return(df) # Return the modified dataframe
+})
+
+# Combine all dataframes into one
+combined_shelter_occupancy <- bind_rows(shelter_list)
+```
+
+Rewrite the ID column to avoid duplicate IDs
+```{r}
+combined_shelter_occupancy <- combined_shelter_occupancy %>%
+  mutate('_id' = row_number())
+```
+
+
+## Download Crime Data
+```{r}
+# load the data
+crime_indicators <- read_csv('raw-data/Major_Crime_Indicators_Open_Data_6927126107499016617.csv')
+
+sapply(crime_indicators, class)
+```
+
+As we are more interested in the crime occurrence date rather than crime reported rate, we can remove the REPORT_DATE, REPORT_YEAR, REPORT_MONTH, REPORT_DAY, REPORT_DOY, REPORT_DOW, REPORT_HOUR columns, as well as the HOOD_140 and NEIGHBOURHOOD_140 columns, since they are an older format and we do not have data that is only in the older format
+```{r}
+crime_indicators <- crime_indicators %>%
+  select(-(c(REPORT_DATE, REPORT_YEAR, REPORT_MONTH, REPORT_DAY, REPORT_DOY, REPORT_DOW, REPORT_HOUR, HOOD_140, NEIGHBOURHOOD_140)))
+```
+
+
+Convert Date format from character to date
+```{r}
+# convert OCC_Date to date format
+crime_indicators <- crime_indicators %>%
+  separate(OCC_DATE, into = c("OCC_DATE", "OCC_TIME"), sep = " ", extra = "drop") %>%
+  select(-OCC_TIME)
+
+crime_indicators$OCC_DATE <- as.Date(crime_indicators$OCC_DATE, format = "%m/%d/%Y")
+
+sapply(crime_indicators, class)
+```
+Retrieve the postal codes
+
+```{r}
+# filter data for 2021 onwards to match shelter data
+crime_indicators <- crime_indicators %>%
+  filter(OCC_YEAR >= 2021)
+```
+
+```{r}
+# get neighourhood data in another dataframe
+hood_data <- crime_indicators %>%
+  select(HOOD_158, NEIGHBOURHOOD_158)
+
+hood_data <- unique(hood_data)
+```
+
+get all unique shelter addresses
+```{r}
+shelter_addresses <- combined_shelter_occupancy %>%
+  select(ORGANIZATION_NAME, SHELTER_ID, LOCATION_ID, LOCATION_NAME, LOCATION_ADDRESS, LOCATION_POSTAL_CODE, LOCATION_CITY)
+
+shelter_addresses <- unique(shelter_addresses)
+```
+
+next, we downloaded shelter addresses and manually located the neighbourhood number according to each shelter location address using [The Toronto Neighbourhood Finder](https://www.toronto.ca/city-government/data-research-maps/neighbourhoods-communities/neighbourhood-profiles/find-your-neighbourhood/#location=445%20Rexdale%20Blvd&lat=43.7160920343&lng=-79.5941496376&zoom=11)
+
+Now, we are reloading that data
+```{r}
+shelter_addresses <- read_csv('raw-data/shelter_address_list.csv')
+sapply(shelter_addresses, class)
+```
+Add neighbourhood number to each shelter address
+```{r}
+shelter_with_hoods <- merge(combined_shelter_occupancy, shelter_addresses[, c("LOCATION_POSTAL_CODE", "NEIGHBOURHOOD")], by = "LOCATION_POSTAL_CODE", all.x = TRUE)
+```
+
+Remove duplicate ID values
+```{r}
+shelter_with_hoods <- shelter_with_hoods %>%
+  distinct()
+```
+
+
+Rename 'NEIGHBOURHOOD' column to 'HOOD_158'
+```{r}
+shelter_with_hoods <- shelter_with_hoods %>%
+  rename('HOOD_158' = 'NEIGHBOURHOOD')
+```
+
+Convert the HOOD_158 column to character
+```{r}
+shelter_with_hoods$HOOD_158 <- sprintf("%03d", shelter_with_hoods$HOOD_158)
+```
+
+Rename OCCUPANCY_DATE to date for easier merging
+```{r}
+shelter_with_hoods <- shelter_with_hoods %>%
+  rename(date = OCCUPANCY_DATE)
+```
+
+
+We will also remove all shelter data for Postal Codes not beginning with M, as those are technically in Vaughan and all Toronto postal codes begin with M. In addition, there is no crime data for these postal codes.
+```{r}
+shelter_with_hoods <- shelter_with_hoods %>%
+  mutate(postal_code_list = strsplit(LOCATION_POSTAL_CODE, split='')) %>%
+  mutate(first_code = sapply(postal_code_list, `[`, 1)) %>%
+  filter(first_code == 'M') %>%
+  select(-(c(postal_code_list, first_code)))
+```
+
+Now we want to combine the shelter data with the crime data. We will start by grouping the 
+
+```{r}
+unique(crime_indicators$MCI_CATEGORY)
+```
+
+
+```{r}
+grouped_crime <- crime_indicators %>%
+  group_by(OCC_DATE, HOOD_158, MCI_CATEGORY) %>%
+  summarise(count = n(), .groups = "drop") %>%  # Count occurrences
+  pivot_wider(names_from = MCI_CATEGORY, values_from = count, values_fill = 0) %>% # Pivot to wide format
+  mutate(total_crime = rowSums(across(where(is.numeric)))) %>%
+  rename(date = OCC_DATE) %>%
+  mutate(crime_date = date)
+```
+
+```{r}
+crime_and_shelter <- shelter_with_hoods %>%
+  left_join(grouped_crime, by = c("date", "HOOD_158")) %>%
+  mutate(across(c('Assault', 'Auto Theft', 'Theft Over', 'Robbery', 'Break and Enter', total_crime), ~ replace_na(.x, 0))) # assume no crime in these columns and replace with 0
+```
+
+
+Retrieve historic weather data collected from [Extreme Weather Watch](https://www.extremeweatherwatch.com/cities/toronto/year-2024)
+
+```{r}
+toronto_weather <- read_csv('raw-data/toronto-weather-data.csv')
+
+class(toronto_weather)
+```
+Convert temp and precipitation data to numeric:
+
+```{r}
+toronto_weather <- toronto_weather %>%
+  mutate(
+    max_temp_celsius = as.numeric(na_if(trimws(max_temp_celsius), "n/a")),
+    min_temp_celsius = as.numeric(na_if(trimws(min_temp_celsius), "n/a")),
+    precip_cm = as.numeric(na_if(trimws(precip_cm), "n/a"))
+  )
+```
+
+Join weather data to merged date
+
+```{r}
+crime_shelter_weather <- crime_and_shelter %>%
+  left_join(toronto_weather, by = 'date')
+```
+
+
+
+Retrieve the CPI data for toronto from [Statistics Canada](https://www150.statcan.gc.ca/t1/tbl1/en/cv.action?pid=1810000401).
+
+Note: This was done manually by downloading the required data into a .csv file
+```{r}
+toronto_cpi <- read_csv('raw-data/toronto_cpi.csv')
+
+toronto_cpi <- toronto_cpi %>%
+  rename(cpi_date = date)
+
+toronto_cpi
+```
+
+Merge with the crime_shelter_weather_data
+```{r}
+toronto_cpi <- toronto_cpi %>%
+  mutate(cpi_date = as.Date(paste0(cpi_date, "-01"), format = "%b-%y-%d"))
+sapply(toronto_cpi, class)
+
+toronto_cpi <- toronto_cpi %>%
+  mutate(year = year(as.Date(cpi_date)), month = month(as.Date(cpi_date)))
+
+crime_shelter_weather <- crime_shelter_weather %>%
+  mutate(year = year(as.Date(date)), month = month(as.Date(date)))
+
+cpi_crime_shelter_weather <- crime_shelter_weather %>%
+  left_join(toronto_cpi, by = c("year", "month"))
+```
+
+
+Retrieve the Unemployment Rate for toronto from the [Labor Force Survey](https://www.ontario.ca/page/labour-market#reports). The monthly Ontario reports contain the unemployment rate for each Central Metropolitan Area. We are using the seasonally-adjusted 3-month rolling average rate as per the monthly reports.
+```{r}
+toronto_unemployment <- read_csv('raw-data/toronto_unemployment.csv')
+
+toronto_unemployment
+```
+
+```{r}
+toronto_unemployment <- toronto_unemployment %>%
+  rename(unemployment_date = date) %>%
+  mutate(year = year(as.Date(unemployment_date)), month = month(as.Date(unemployment_date)))
+```
+
+```{r}
+complete_merge <- cpi_crime_shelter_weather %>%
+  left_join(toronto_unemployment, by = c("year", "month"))
+```
+
+Reorder all the columns
+```{r}
+col_list <- colnames(complete_merge)
+col_list
+```
+```{r}
+column_order <- c(
+  "date", "crime_date", "cpi_date", "unemployment_date", "year", "month", # all date columns
+  
+  "_id", "ORGANIZATION_ID", "ORGANIZATION_NAME", "SHELTER_ID", "SHELTER_GROUP",
+  "PROGRAM_ID", "PROGRAM_NAME", "SECTOR", "PROGRAM_MODEL", "OVERNIGHT_SERVICE_TYPE", 
+  "PROGRAM_AREA", "SERVICE_USER_COUNT", "CAPACITY_TYPE", "CAPACITY_ACTUAL_BED", 
+  "CAPACITY_FUNDING_BED", "OCCUPIED_BEDS", "UNOCCUPIED_BEDS", "UNAVAILABLE_BEDS", 
+  "CAPACITY_ACTUAL_ROOM", "CAPACITY_FUNDING_ROOM", "OCCUPIED_ROOMS", "UNOCCUPIED_ROOMS", 
+  "UNAVAILABLE_ROOMS", "OCCUPANCY_RATE_BEDS", "OCCUPANCY_RATE_ROOMS", # all shelter columns
+  
+  "LOCATION_POSTAL_CODE", "LOCATION_ID", "LOCATION_NAME", "LOCATION_ADDRESS", 
+  "LOCATION_CITY", "LOCATION_PROVINCE", "HOOD_158", # all location columns
+  
+  "Assault", "Auto Theft", "Theft Over", "Robbery", "Break and Enter", "total_crime", # all crime columns
+  
+  "max_temp_celsius", "min_temp_celsius", "precip_cm", # all weather columns
+  
+  "cpi_all", "cpi_shelter", # all inflation columns
+  
+  "unemployment_rate" # all unemployment columns
+)
+
+complete_merge <- complete_merge %>%
+  select(all_of(column_order))
+```
+
+
+```{r}
+write_csv(complete_merge, 'merged-data.csv')
+```
+

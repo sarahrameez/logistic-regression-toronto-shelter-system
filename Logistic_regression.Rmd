@@ -1,0 +1,1067 @@
+---
+title: "Logistic Regression"
+author: "Sarah Rameez"
+date: "2024-11-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Logistic Regression
+
+### Load the Libraries
+```{r}
+library(dplyr)
+library(tidyr)
+library(tidyverse)
+library(ggplot2)
+library(lubridate)
+library(stringr)
+library(reshape2)
+library(pscl)
+library(caret)
+library(effects)
+library(car)
+```
+
+### Load the Data
+```{r}
+data <- read_csv('merged-data.csv')
+```
+
+## Descriptive Analysis
+```{r}
+# Select only numeric columns for analysis
+numeric_data <- data[sapply(data, is.numeric)]
+
+colSums(is.na(numeric_data))
+# Drop rows with missing values
+#numeric_data_clean <- na.omit(numeric_data)
+```
+
+
+```{r}
+# Summary Statistics Calculation
+summary_stats <- data.frame(
+  Mean = sapply(numeric_data, mean, na.rm = TRUE),
+  Median = sapply(numeric_data, median, na.rm = TRUE),
+  Std_Dev = sapply(numeric_data, sd, na.rm = TRUE),
+  IQR = sapply(numeric_data, function(x) IQR(x, na.rm = TRUE))
+)
+
+# Display summary statistics
+print(summary_stats)
+```
+
+```{r}
+# Summary Statistics Calculation
+summary_stats <- data.frame(
+  Mean = sapply(numeric_data, mean, na.rm = TRUE),
+  Median = sapply(numeric_data, median, na.rm = TRUE),
+  Std_Dev = sapply(numeric_data, sd, na.rm = TRUE),
+  IQR = sapply(numeric_data, function(x) IQR(x, na.rm = TRUE))
+)
+```
+
+
+
+### Keep only selected variables: 
+- Availability total (dependent variable) - present limitation in paper
+- Capacity
+- Sector
+- Hood_158 (Neighbourhood) 
+- Total Crime
+- CPI_All 
+- Unemployment Rate
+- Minimum Temperature
+- Precipitation (cm)
+
+#### Create total capacity and occupancy
+
+Since we have two kinds of capacities - Room-based and Bed-based, we need to either delete one or the other category, or determine the number of beds per room and apply them to each room-based shelter.
+
+First, we will determine the distribution of rooms and bed-based capacities:
+```{r}
+ggplot(data, aes(x = as.factor(CAPACITY_TYPE))) +
+  geom_bar(fill = "steelblue") +
+  labs(
+    title = "Distribution of Capacity Type",
+    x = "Capacity Type",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+prop_table <- prop.table(table(data$CAPACITY_TYPE))
+
+print(prop_table)
+```
+Given Room-based capacities make up roughly 32% of the data, we cannot remove it completely without significantly skewing our analysis.
+
+We therefore reached out to all room-based shelters and requested them to provide the number of beds per room, out of which 8 shelters were able to provide the data
+
+```{r}
+shelter_info <- data %>%
+  filter(CAPACITY_TYPE == 'Room Based Capacity') %>%
+  select(SHELTER_ID, ORGANIZATION_NAME, CAPACITY_TYPE, CAPACITY_ACTUAL_ROOM, LOCATION_NAME, LOCATION_ADDRESS, LOCATION_POSTAL_CODE) %>%
+  distinct(SHELTER_ID, .keep_all = TRUE)
+
+unique(shelter_info$ORGANIZATION_NAME)
+```
+
+```{r}
+# load the manually inserted data
+shelter_rooms <- read_csv('raw-data/shelter-room-beds.csv')
+shelter_rooms_mean <- mean(shelter_rooms$`Beds per room`, na.rm = TRUE)
+```
+Now that we have the average number of rooms, we apply it to the dataframe for all room-based capacity types:
+```{r}
+# replace NA values with 0 for room based capacity and occupancy
+data <- data %>%
+  mutate(
+    CAPACITY_ACTUAL_ROOM = ceiling(replace(CAPACITY_ACTUAL_ROOM, is.na(CAPACITY_ACTUAL_ROOM), 0) * shelter_rooms_mean),
+    OCCUPIED_ROOMS = ceiling(replace(OCCUPIED_ROOMS, is.na(OCCUPIED_ROOMS), 0) * shelter_rooms_mean),
+    UNOCCUPIED_ROOMS = ceiling(replace(UNOCCUPIED_ROOMS, is.na(UNOCCUPIED_ROOMS), 0 * shelter_rooms_mean))
+  )
+```
+
+
+```{r}
+# combine the updated capacities and occupancies
+data_filtered <- data %>%
+  mutate(
+    capacity_total = replace_na(CAPACITY_ACTUAL_BED, 0) + replace_na(CAPACITY_ACTUAL_ROOM, 0),
+    occupied_total = replace_na(OCCUPIED_BEDS, 0) + replace_na(OCCUPIED_ROOMS, 0),
+    availability_total = replace_na(UNOCCUPIED_BEDS, 0) + replace_na(UNOCCUPIED_ROOMS, 0),
+    available_binary = if_else(availability_total > 0, 1, 0),
+    availability_rate = availability_total / capacity_total
+  )
+```
+
+#### Remove unnecessary variables
+```{r}
+data_relevant <- data_filtered %>%
+  select(c(date, available_binary, availability_total, availability_rate, capacity_total, SECTOR, HOOD_158, total_crime, cpi_all, unemployment_rate, min_temp_celsius, precip_cm)) %>%
+  rename(neighbourhood = HOOD_158,
+         sector = SECTOR)
+```
+
+#### Check for NA values
+```{r}
+colSums(is.na(data_relevant))
+
+summary(data_relevant)
+```
+Confirmed that no value is NA. However from the summary I can see a few availability total values are -1, so will be cleaning (removing) those.
+```{r}
+data_relevant <- data_relevant %>%
+  filter(availability_total >= 0,
+         !is.na(min_temp_celsius)) %>%
+  mutate(unemployment_rate = unemployment_rate * 100)
+
+colSums(is.na(data_relevant))
+```
+
+
+Now, we will do some exploratory visual analysis.
+
+1. Group numeric columns by date
+```{r}
+grouped_data <- data_relevant %>%
+  group_by(date) %>%
+  summarise(
+    # Sum crime-related columns
+    across(c(capacity_total, availability_total, total_crime), sum, na.rm = TRUE),
+    # Aggregate available_binary: 1 if any row for the date is 1
+    available_binary = as.numeric(any(available_binary == 1)),
+    # Calculate the average for cpi_all and unemployment_rate
+    cpi_all_avg = mean(cpi_all, na.rm = TRUE),
+    unemployment_rate_avg = mean(unemployment_rate, na.rm = TRUE),
+    min_temp_celsius = mean(min_temp_celsius, na.rm = TRUE),
+    precip_cm = mean(precip_cm, na.rm = TRUE)
+  ) %>%
+  mutate(availability_rate = availability_total / capacity_total)
+```
+
+
+2. Plot numeric variables over time
+```{r}
+# Reshape the data into long format for faceting
+grouped_data_long <- grouped_data %>%
+  pivot_longer(
+    cols = c(capacity_total, availability_rate, total_crime, cpi_all_avg, unemployment_rate_avg, min_temp_celsius, precip_cm),
+    names_to = "variable",
+    values_to = "value"
+  )
+```
+
+
+Create
+```{r}
+# Reshape the data into long format for faceting
+# Variables of interest
+variables_of_interest <- c(
+  "capacity_total", "total_crime", "cpi_all", 
+  "unemployment_rate", "min_temp_celsius", "precip_cm"
+)
+
+# Reshape the original data into long format for faceting
+data_relevant_long <- data_relevant %>%
+  select(all_of(variables_of_interest), available_binary) %>%
+  pivot_longer(
+    cols = -available_binary, # Keep available_binary as the grouping variable
+    names_to = "variable",
+    values_to = "value"
+  )
+
+# Create the facet grid plot with two box plots for each variable
+ggplot(data_relevant_long, aes(x = as.factor(available_binary), y = value, fill = as.factor(available_binary))) +
+  geom_boxplot(alpha = 0.8) +
+  facet_wrap(~ variable, scales = "free_y") + # Facet by variable
+  scale_fill_manual(
+    values = c("0" = "steelblue", "1" = "orange"),
+    labels = c("0" = "Unavailable", "1" = "Available")
+  ) +
+  labs(
+    title = "Box Plots of Variables by Availability",
+    x = "Availability Binary (0 = No, 1 = Yes)",
+    y = "Value",
+    fill = "Availability"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(size = 10, face = "bold")
+  )
+```
+
+
+
+3. Apply some smoothing to the availability_total and total crime graphs
+```{r}
+ggplot(grouped_data_long, aes(x = date, y = value)) +
+  geom_smooth(method = "loess", formula = 'y ~ x', se = FALSE, color = "blue", alpha = 0.8) + # Smoothing for all
+  facet_wrap(~ variable, scales = "free_y") +
+  labs(title = "Grouped Data Over Time with Smoothing for All Variables",
+       x = "Date", 
+       y = "Value") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+ggplot(grouped_data_long, aes(x = date, y = value)) +
+  geom_smooth(method = "loess", formula = 'y ~ x', se = FALSE, color = "#019ef3", alpha = 0.8) + # Smoothing with preferred color
+  facet_wrap(~ variable, scales = "free_y", ncol = 4) + # 4 facets per row
+  labs(
+    title = "Grouped Data Over Time with Smoothing for All Variables",
+    x = "Date", 
+    y = "Value"
+  ) +
+  theme_minimal(base_size = 16) + # Larger text for better readability
+  theme(
+    panel.background = element_rect(fill = "black", color = NA), # Black panel background
+    plot.background = element_rect(fill = "black", color = NA),  # Black overall background
+    axis.text = element_text(color = "white", size = 8),        # White axis text
+    axis.title = element_text(color = "white", size = 12),       # White axis titles
+    strip.text = element_text(color = "white", face = "bold", size = 10), # White facet labels
+    plot.title = element_text(color = "white", face = "bold", size = 18), # White title
+    panel.grid = element_line(color = "gray30"),                 # Subtle grid lines
+    plot.subtitle = element_text(color = "white", size = 14),    # White subtitle (if added)
+    axis.text.x = element_text(angle = 45, hjust = 1, color = "white") # Rotated white x-axis labels
+  )
+```
+
+```{r}
+ggplot(grouped_data_long, aes(x = date, y = value)) +
+  geom_smooth(method = "loess", formula = 'y ~ x', se = FALSE, color = "#019ef3", alpha = 0.8) + # Smoothing with preferred color
+  facet_wrap(~ variable, scales = "free_y", ncol = 4) + # 4 facets per row
+  labs(
+    title = "Grouped Data Over Time with Smoothing for All Variables",
+    x = "Date", 
+    y = "Value"
+  ) +
+  theme_minimal(base_size = 16) + # Larger text for better readability
+  theme(
+    panel.background = element_rect(fill = "black", color = NA), # Black panel background
+    plot.background = element_rect(fill = "black", color = NA),  # Black overall background
+    axis.text = element_text(color = "white", size = 18),        # White axis text
+    axis.title = element_text(color = "white", size = 18),       # White axis titles
+    strip.text = element_text(color = "white", face = "bold", size = 24), # White facet labels
+    plot.title = element_text(color = "white", face = "bold", size = 18), # White title
+    panel.grid = element_line(color = "gray30"),                 # Subtle grid lines
+    plot.subtitle = element_text(color = "white", size = 18),    # White subtitle (if added)
+    axis.text.x = element_text(angle = 45, hjust = 1, color = "white"), # Rotated white x-axis labels
+    panel.spacing = unit(2, "lines")  # Increase gap between facets
+  )
+
+# Save the plot as a wider output
+ggsave("wide_time_line.png", width = 20, height = 10, dpi = 300)
+```
+
+
+5. Plot histograms of numeric variables for each day
+```{r}
+data_relevant_long <- data_relevant %>%
+  pivot_longer(
+    cols = c(capacity_total, availability_total, availability_rate, total_crime, cpi_all, unemployment_rate, min_temp_celsius, precip_cm),
+    names_to = "variable",
+    values_to = "value"
+  )
+
+ggplot(data = data_relevant_long, mapping = aes(x = value)) +
+  geom_histogram(bins = 10, fill = "skyblue", color = "black") +
+  facet_wrap(~ variable, scales = "free", ncol = 3) +
+  theme_minimal() +
+  labs(title = "Histograms of Numerical Variables in Dataset",
+       x = "Value",
+       y = "Frequency")
+```
+
+```{r}
+# Create the histograms with increased size
+ggplot(data = data_relevant_long, mapping = aes(x = value)) +
+  geom_histogram(bins = 10, fill = "#019ef3", color = "black") +
+  facet_wrap(~ variable, scales = "free", ncol = 4) + # 4 graphs per row
+  theme_minimal(base_size = 16) +  # Larger text size for clarity
+  theme(
+    panel.background = element_rect(fill = "black", color = NA), # Black background
+    plot.background = element_rect(fill = "black", color = NA),  # Black background for entire plot
+    panel.grid = element_line(color = "gray30"),                 # Subtle grid lines
+    axis.text = element_text(color = "white", size = 8),        # White and larger axis text
+    axis.title = element_text(color = "white", size = 12),       # White and larger axis titles
+    strip.text = element_text(color = "white", face = "bold", size = 8), # Larger facet labels
+    plot.title = element_text(color = "white", face = "bold", size = 18), # Larger title
+    plot.subtitle = element_text(color = "white", size = 14)     # Larger subtitle (if added)
+  ) +
+  labs(
+    title = "Distribution of Numerical Variables",
+    x = "Value",
+    y = "Frequency"
+  )
+```
+
+```{r}
+data_relevant_long_outlier_removed <- data_relevant %>%
+  pivot_longer(
+    cols = c(capacity_total, availability_total, availability_rate, total_crime, cpi_all, unemployment_rate, min_temp_celsius, precip_cm),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  group_by(variable) %>% # Group by variable for separate calculations
+  filter(
+    abs(value - mean(value, na.rm = TRUE)) <= 3 * sd(value, na.rm = TRUE) # Remove outliers
+  ) %>%
+  ungroup()
+
+ggplot(data = data_relevant_long_outlier_removed, mapping = aes(x = value)) +
+  geom_histogram(bins = 10, fill = "#019ef3", color = "black") +
+  facet_wrap(
+    ~ variable, 
+    scales = "free", 
+    ncol = 4, 
+    strip.position = "top"  # Place labels on top for a cleaner look
+  ) +
+  theme_minimal(base_size = 16) +  # Larger text size for clarity
+  theme(
+    panel.background = element_rect(fill = "black", color = NA), # Black background
+    plot.background = element_rect(fill = "black", color = NA),  # Black background for entire plot
+    panel.grid = element_line(color = "gray30"),                 # Subtle grid lines
+    axis.text = element_text(color = "white", size = 18),        # White and larger axis text
+    axis.title = element_text(color = "white", size = 18),       # White and larger axis titles
+    strip.text = element_text(color = "white", face = "bold", size = 18), # Larger facet labels
+    plot.title = element_text(color = "white", face = "bold", size = 18), # Larger title
+    plot.subtitle = element_text(color = "white", size = 14),     # Larger subtitle (if added)
+    plot.margin = margin(t = 10, r = 20, b = 10, l = 20),         # Add extra plot margins
+    panel.spacing = unit(1.5, "lines")  # Increase gap between facets
+  ) +
+  labs(
+    title = "Distribution of Numerical Variables",
+    x = "Value",
+    y = "Frequency"
+  )
+```
+
+
+```{r}
+# Create the histograms with increased size and wider gaps between facets
+ggplot(data = data_relevant_long, mapping = aes(x = value)) +
+  geom_histogram(bins = 10, fill = "#019ef3", color = "black") +
+  facet_wrap(
+    ~ variable, 
+    scales = "free", 
+    ncol = 4, 
+    strip.position = "top"  # Place labels on top for a cleaner look
+  ) +
+  theme_minimal(base_size = 16) +  # Larger text size for clarity
+  theme(
+    panel.background = element_rect(fill = "black", color = NA), # Black background
+    plot.background = element_rect(fill = "black", color = NA),  # Black background for entire plot
+    panel.grid = element_line(color = "gray30"),                 # Subtle grid lines
+    axis.text = element_text(color = "white", size = 18),        # White and larger axis text
+    axis.title = element_text(color = "white", size = 18),       # White and larger axis titles
+    strip.text = element_text(color = "white", face = "bold", size = 18), # Larger facet labels
+    plot.title = element_text(color = "white", face = "bold", size = 18), # Larger title
+    plot.subtitle = element_text(color = "white", size = 14),     # Larger subtitle (if added)
+    plot.margin = margin(t = 10, r = 20, b = 10, l = 20),         # Add extra plot margins
+    panel.spacing = unit(1.5, "lines")  # Increase gap between facets
+  ) +
+  labs(
+    title = "Distribution of Numerical Variables",
+    x = "Value",
+    y = "Frequency"
+  )
+
+# Save the plot as a wider output
+ggsave("wide_histograms.png", width = 20, height = 10, dpi = 300)
+```
+
+
+```{r}
+binary_distribution <- data_relevant %>%
+  count(available_binary) %>%
+  mutate(
+    prop = n / sum(n),
+    label = paste0(round(prop * 100, 1), "%") # Calculate percentages
+  )
+
+ggplot(binary_distribution, aes(x = "", y = prop, fill = as.factor(available_binary))) +
+  geom_bar(stat = "identity", width = 1) +
+  geom_text(aes(label = label), position = position_stack(vjust = 0.5), color = "white", size = 5) +
+  coord_polar(theta = "y") +
+  scale_fill_manual(values = c("#6c35d9", "#019ef3"), labels = c("0 (No)", "1 (Yes)")) +
+  labs(
+    title = "Shelter Availability",
+    fill = "Availability"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.background = element_rect(fill = "black"),
+    plot.background = element_rect(fill = "black"),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank(),
+    plot.title = element_text(color = "white", hjust = 0.5, size = 16),
+    legend.text = element_text(color = "white"),
+    legend.title = element_text(color = "white")
+  )
+```
+
+```{r}
+sector_distribution <- data_relevant %>%
+  count(sector) %>%
+  mutate(
+    prop = n / sum(n),
+    label = paste0(n, " (", round(prop * 100, 1), "%)") # Include counts and percentages
+  )
+
+ggplot(sector_distribution, aes(x = reorder(sector, -n), y = n, fill = sector)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  scale_fill_manual(values = c("#6c35d9", "#019ef3", "#6c35d9", "#019ef3", "#6c35d9")) +
+  labs(
+    title = "Shelter Distribution by ",
+    x = "Sector",
+    y = "Count",
+    fill = "Sector"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.background = element_rect(fill = "black"),
+    plot.background = element_rect(fill = "black"),
+    axis.text = element_text(color = "white"),
+    axis.title = element_text(color = "white"),
+    panel.grid = element_blank(),
+    plot.title = element_text(color = "white", hjust = 0.5, size = 16),
+    legend.text = element_text(color = "white"),
+    legend.title = element_text(color = "white")
+  )
+```
+
+
+```{r}
+sector_distribution <- data_relevant %>%
+  count(sector) %>%
+  mutate(prop = n / sum(n))
+
+ggplot(sector_distribution, aes(x = "", y = prop, fill = sector)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar(theta = "y") +
+  scale_fill_manual(values = c("#6c35d9", "#019ef3", "#6c35d9", "#019ef3", "#6c35d9")) +
+  labs(
+    title = "Sector Distribution",
+    fill = "Sector"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.background = element_rect(fill = "black"),
+    plot.background = element_rect(fill = "black"),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank(),
+    plot.title = element_text(color = "white", hjust = 0.5, size = 16),
+    legend.text = element_text(color = "white"),
+    legend.title = element_text(color = "white")
+  )
+```
+
+
+Plot the categorical variables in a histogram
+```{r}
+# ensure categorical variables are factors
+data_relevant <- data_relevant %>%
+  mutate(
+    sector = factor(sector),
+    neighbourhood = factor(neighbourhood),
+    available_binary = as.factor(available_binary) # Dependent variable as a factor
+  )
+
+summary(data_relevant)
+```
+
+First, view the distribution of the available binary data
+```{r}
+# begin with the distribution of the binary dependent variable
+prop.table(table(data_relevant$available_binary))
+
+ggplot(data_relevant, aes(x = as.factor(available_binary))) +
+  geom_bar(fill = "steelblue") +
+  labs(
+    title = "Distribution of Availability Binary",
+    x = "Availability (0 = No, 1 = Yes)",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Example: Plot a histogram (bar plot) for a categorical variable
+ggplot(data_relevant, aes(x = as.factor(sector))) +
+  geom_bar(fill = "steelblue") +
+  labs(
+    title = "Distribution of Sectors",
+    x = "Capacity Type",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# check number of shelters in each neighbourhood
+grouped_data_hood <- data %>%
+  group_by(HOOD_158) %>%
+  summarise(num_shelters = n_distinct(SHELTER_ID))
+
+# Create a bar plot
+ggplot(grouped_data_hood, aes(x = reorder(HOOD_158, -num_shelters), y = num_shelters)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(
+    title = "Number of Shelters in Each Neighborhood",
+    x = "Neighborhood (HOOD_158)",
+    y = "Number of Shelters"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(hjust = 0.5)
+  )
+```
+
+6. Plot scatter plot for all numerical variables against the 'available binary' variable
+```{r}
+data_relevant_numeric <- data_relevant %>%
+  select_if(is.numeric)
+
+data_numeric_standard <- data_relevant_numeric %>%
+  mutate_all(~ (scale(.) %>% as.vector))
+
+data_scatter <- data_numeric_standard %>%
+  as.data.frame() %>%
+  gather(key = "variable", value = "value",
+         -c(availability_total, availability_rate))
+
+
+ggplot(data = data_scatter, mapping = aes(x = value, y = availability_rate)) +
+  geom_point() +
+  facet_wrap(~ variable, ncol = 3)
+```
+(explain why this data is not relevant for linear regression)
+
+## Logistic Reegression
+
+Create a correlation matrix
+```{r}
+# create a correlation matrix
+data_relevant_numeric <- data_relevant_numeric %>%
+  select(-availability_total)
+
+cor_matrix <- cor(data_relevant_numeric, use = "pairwise.complete.obs")
+
+# create function for correlation matrix
+lower_triangle_with_space <- function(matrix) {
+  matrix[upper.tri(matrix)] <- NA
+  return(matrix)
+}
+
+cor_matrix_lower <- lower_triangle_with_space(cor_matrix)
+
+cor_matrix_lower <- format(round(cor_matrix_lower, 2), nsmall = 2)
+
+means <- colMeans(data_relevant_numeric, na.rm = TRUE)
+sds <- apply(data_relevant_numeric, 2, sd, na.rm = TRUE)
+
+data_numeric_mean_sd_corr <- cbind(
+    Mean = format(round(means, 2), nsmall = 2),
+    SD = format(round(sds, 2), nsmall = 2),
+    cor_matrix_lower
+)
+
+# not working
+data_numeric_mean_sd_corr[is.na(data_numeric_mean_sd_corr)] <- " "
+data_numeric_mean_sd_corr <- replace(data_numeric_mean_sd_corr, is.na(data_numeric_mean_sd_corr), " ")
+
+# format the summary table
+knitr::kable(data_numeric_mean_sd_corr, format = "html")
+```
+
+Plot the correlation heatmap
+```{r}
+# Convert to long format
+cor_matrix_long <- melt(cor_matrix)
+
+# Plot the heatmap
+ggplot(data = cor_matrix_long, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(
+    low = "blue", mid = "white", high = "red", midpoint = 0, limit = c(-1, 1), space = "Lab"
+  ) +
+  geom_text(aes(label = format(round(value, 2), nsmall = 2)), color = "black", size = 3) +
+  labs(title = "Correlation Heatmap with Values", x = "", y = "") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+    axis.text.y = element_text(size = 8),
+    axis.title = element_blank()
+  )
+```
+
+```{r}
+library(ggplot2)
+library(reshape2)
+
+# Convert to long format
+cor_matrix_long <- melt(cor_matrix)
+
+# Plot the heatmap
+ggplot(data = cor_matrix_long, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(
+    low = "#4b007a", high = "#019ef3", limits = c(-1, 1), name = "Correlation"
+  ) +
+  geom_text(aes(label = format(round(value, 2), nsmall = 2)), color = "white", size = 3) +
+  labs(
+    title = "Correlation Heatmap with Values",
+    x = "",
+    y = ""
+  ) +
+  theme_minimal() +
+  theme(
+    panel.background = element_rect(fill = "black", color = NA),
+    plot.background = element_rect(fill = "black", color = NA),
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, color = "white"),
+    axis.text.y = element_text(size = 8, color = "white"),
+    plot.title = element_text(color = "white", hjust = 0.5, size = 16),
+    axis.title = element_blank(),
+    legend.background = element_rect(fill = "black", color = NA),
+    legend.text = element_text(color = "white"),
+    legend.title = element_text(color = "white")
+  )
+```
+
+```{r}
+library(ggplot2)
+library(reshape2)
+
+# Convert to long format
+cor_matrix_long <- melt(cor_matrix)
+
+# Custom axis labels
+axis_labels <- c("Availability Rate", "Capacity", "Crime", "Inflation", "Unemployment", "Min Temp", "Precipitation") # Replace with your labels
+
+# Plot the heatmap
+ggplot(data = cor_matrix_long, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(
+    low = "#4b007a", high = "#019ef3", limits = c(-1, 1), name = "Correlation"
+  ) +
+  geom_text(aes(label = format(round(value, 2), nsmall = 2)), color = "white", size = 3) +
+  labs(
+    title = "Correlation Heatmap with Values",
+    x = "Variables",
+    y = "Variables"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.background = element_rect(fill = "black", color = NA),
+    plot.background = element_rect(fill = "black", color = NA),
+    axis.text.x = element_text(angle = 20, vjust = 1, hjust = 1, color = "white"),
+    axis.text.y = element_text(size = 10, color = "white"),
+    plot.title = element_text(color = "white", hjust = 0.5, size = 16),
+    axis.title = element_text(color = "white", size = 12),
+    legend.background = element_rect(fill = "black", color = NA),
+    legend.text = element_text(color = "white"),
+    legend.title = element_text(color = "white"),
+    panel.grid = element_blank()
+  ) +
+  scale_x_discrete(labels = axis_labels) + # Replace x-axis labels
+  scale_y_discrete(labels = axis_labels)   # Replace y-axis labels
+
+# Save the wider plot
+ggsave("correlation_heatmap_wide.png", width = 16, height = 10, dpi = 300)
+```
+
+
+
+# MODEL AND INTERPRETATIONS
+Build the initial model based on initial selection of variables:
+
+Fit the model, and calculate odds ratio:
+```{r}
+# set baseline to a neighbourhood with an average number of shelters 
+data_relevant$neighbourhood <- relevel(factor(data_relevant$neighbourhood), ref = "172")
+
+model <- glm(
+  available_binary ~ capacity_total + sector + neighbourhood + 
+    total_crime + cpi_all + unemployment_rate + min_temp_celsius + precip_cm,
+  data = data_relevant,
+  family = binomial
+)
+
+summary(model)
+```
+multiplying unemployment rate by 100 is re-scaling
+
+```{r}
+# Extract model summary
+summary_model <- summary(model)
+
+# Create a dataframe with coefficients, standard errors, z-values, and p-values
+summary_df <- as.data.frame(summary_model$coefficients)
+
+# Rename columns for clarity
+colnames(summary_df) <- c("Estimate", "Std_Error", "Z_value", "P_value")
+
+# Add exponentiated odds ratios (exp(coef))
+summary_df$Odds_Ratio <- exp(coef(model))
+
+# Round values for readability
+summary_df <- summary_df %>%
+  mutate(across(c(Estimate, Std_Error, Z_value, P_value, Odds_Ratio), ~ round(., 3)))
+
+# View the resulting dataframe
+summary_df
+```
+
+### Initial interpretations
+- **Intercept (Estimate: 9.686, Odds Ratio: 16096.447)**: When all predictors are at their baseline (reference category), the odds of availability are very high. The intercept is not directly interpretable, as it is very unlikely that the selected independent variables are always 0. 
+
+- **Capacity Total (Estimate: 0.001, Odds Ratio: 1.001, P-Value: 0.000:)**: A one-unit increase in capacity_total (total shelter capacity) slightly increases the odds of availability by 0.1%; this odds ratio is at a highly significant level.
+
+- **Total Crime (Estimate: 0.009, Odds Ratio: 1.009, P-Value: 0.024:)**: A one-unit increase in crime increases the odds of availability by 0.9%. Though the effect is significant, its size is small. This leads to speculation as to why increased crime results in increased likelihood of availability - do those who frequently use the shelter system avoid shelters in areas with high levels of crime?
+
+- **CPI (Estimate: -0.072, Odds Ratio: 0.931, P-Value: 0.000)**: A one-unit increase in the Consumer Price Index decreases the odds of availability by 6.9%. This is in line with our assumptions, where increased inflation results in more demand for shelters as residents of the city are unable to pay for shelter and other basic needs. 
+
+- **Unemployment Rate (Estimate: 8.071, Odds Ratio: 3200.259, P-Value: 0.000)**: A one-unit increase in unemployment rate (e.g., 0.01 or 1%) drastically increases the odds of availability by a factor of 3200, and a very significant level. This suggests that unemployment rate is a very strong influence for shelter availability, however it is the opposite of the effect we anticipated - that the greater the unemployment, the lower the availability. This odds ratio suggests other possibilities - such as if the city took measures to open new shelters during the periods of high unemployment.
+
+- **Sector - Using the reference category Families**
+- **Men (Estimate: -0.980, Odds Ratio: 0.375, P-Value: 0.000)**: Being a shelter for men decreases the odds of availability by 62.5% compared to family shelters at a highly significant level.
+- **Mixed Adult (Estimate: -0.085, Odds Ratio: 0.919, P-Value: 0.001)**: Mixed adult shelters have 8.1% lower odds of availability compared to family shelters, at a high level of significance, though less significant than the Men's category.
+- **Women (Estimate: -0.491, Odds Ratio: 0.612, P-Value:0.000)**: Shelters for women have 38.8% lower odds of availability compared to family shelters at a very high level of significance.
+- **Youth (Estimate: 0.041, Odds Ratio: 1.042, P-Value:0.156)**: Youth shelters show a small, non-significant increase in availability odds.
+
+- **Neighbourhood - Using the reference category 'neighbourhood172'**
+
+1.**Neighbourhood081 (Estimate: 3.420, Odds Ratio: 30.563, P-Value: 0.000)**: Being in Neighbourhood081 increases the odds of availability by 2956.3% compared to Neighbourhood172 at a very high level of significance.
+
+2.**Neighbourhood152 (Estimate: 3.536, Odds Ratio: 34.340, P-Value: 0.000)**: Being in Neighbourhood152 increases the odds of availability by 3334.0% compared to Neighbourhood172 at a very high level of significance.
+
+3.**Neighbourhood080 (Estimate: 2.309, Odds Ratio: 10.069, P-Value: 0.000)**: Being in Neighbourhood080 increases the odds of availability by 906.9% compared to Neighbourhood172 at a very high level of significance.
+
+4.**Neighbourhood155 (Estimate: 2.512, Odds Ratio: 12.334, P-Value: 0.000)** Being in Neighbourhood155 increases the odds of availability by 1133.4% compared to Neighbourhood172 at a very high level of significance.
+
+5.**Neighbourhood135 (Estimate: 2.502, Odds Ratio: 12.212, P-Value: 0.000)**: Being in Neighbourhood135 increases the odds of availability by 1121.2% compared to Neighbourhood172 at a very high level of significance.
+
+6.**Neighbourhood094 (Estimate: 1.931, Odds Ratio: 6.896, P-Value: 0.000)**: Being in Neighbourhood094 increases the odds of availability by 589.6% compared to Neighbourhood172 at a very high level of significance.
+
+7.**Neighbourhood151 (Estimate: 1.588, Odds Ratio: 4.892, P-Value: 0.000)**: Being in Neighbourhood151 increases the odds of availability by 389.2% compared to Neighbourhood172 at a very high level of significance.
+
+8.**Neighbourhood037 (Estimate: 1.298, Odds Ratio: 3.663, P-Value: 0.000)**: Being in Neighbourhood037 increases the odds of availability by 266.3% compared to Neighbourhood172 at a very high level of significance.
+
+9.**Neighbourhood162 (Estimate: 1.322, Odds Ratio: 3.752, P-Value: 0.000)**: Being in Neighbourhood162 increases the odds of availability by 275.2% compared to Neighbourhood172 at a very high level of significance.
+
+10.**Neighbourhood050 (Estimate: 1.060, Odds Ratio: 2.885, P-Value: 0.000)**: Being in Neighbourhood050 increases the odds of availability by 188.5% compared to Neighbourhood172 at a very high level of significance.
+
+11.**Neighbourhood073 (Estimate: 0.606, Odds Ratio: 1.832, P-Value: 0.000)**: Being in Neighbourhood073 increases the odds of availability by 83.2% compared to Neighbourhood172 at a very high level of significance.
+
+12.**Neighbourhood074 (Estimate: 0.546, Odds Ratio: 1.727, P-Value: 0.000)**: Being in Neighbourhood074 increases the odds of availability by 72.7% compared to Neighbourhood172 at a very high level of significance.
+
+13.**Neighbourhood002 (Estimate: 0.912, Odds Ratio: 2.488, P-Value: 0.000)**: Being in Neighbourhood002 increases the odds of availability by 148.8% compared to Neighbourhood172 at a very high level of significance.
+
+14.**Neighbourhood078 (Estimate: 0.263, Odds Ratio: 1.301, P-Value: 0.000)**: Being in Neighbourhood078 increases the odds of availability by 30.1% compared to Neighbourhood172 at a very high level of significance.
+
+15.**Neighbourhood164 (Estimate: 1.075, Odds Ratio: 2.929, P-Value: 0.000)**: Being in Neighbourhood164 increases the odds of availability by 192.9% compared to Neighbourhood172 at a very high level of significance.
+
+16.**Neighbourhood170 (Estimate: -0.895, Odds Ratio: 0.409, P-Value: 0.000)**: Neighbourhood170 has 59.1% lower odds of availability compared to Neighbourhood172 at a very high level of significance.
+
+17.**Neighbourhood001 (Estimate: -1.995, Odds Ratio: 0.136, P-Value: 0.000)** Neighbourhood001 has 86.4% lower odds of availability compared to Neighbourhood172 at a very high level of significance.
+
+18.**Neighbourhood173 (Estimate: -1.941, Odds Ratio: 0.143, P-Value: 0.000)**: Neighbourhood173 has 85.7% lower odds of availability compared to Neighbourhood172 at a very high level of significance.
+
+19.**Neighbourhood119 (Estimate: -3.563, Odds Ratio: 0.028, P-Value: 0.000)**: Neighbourhood119 has 97.2% lower odds of availability compared to Neighbourhood172 at a very high level of significance.
+
+20.**Neighbourhood107 (Estimate: -3.668, Odds Ratio: 0.026, P-Value: 0.000)**: Neighbourhood107 has 97.4% lower odds of availability compared to Neighbourhood172 at a very high level of significance.
+
+# ASSESSMENT
+Check overall model fit using Likelihood Test Ratio
+```{r}
+# Null model (intercept only)
+null_model <- glm(
+  available_binary ~ 1,
+  data = data_relevant,
+  family = binomial
+)
+
+lrt <- anova(null_model, model, test = "Chisq")
+print(lrt)
+```
+The likelihood ratio test indicates that the full model, which includes capacity_total, sector, neighbourhood, total_crime, cpi_all, minimum temperature, precipitation and unemployment_rate, provides a significantly better fit compared to the null model ( chi^2(67) = 33847, p < 2.2 times 10^{-16} ). This suggests that these predictors collectively explain a significant portion of the variance in shelter availability.
+
+Assess model fit and predictive power
+```{r}
+# Calculate pseudo R-squared
+pR2(model)
+```
+
+The llh and llhNull calculate the log-likelihood for the full model vs. the null model, similar to above, and like the above, the results indicate the full model fits the data significantly better than the null model, as evidenced by a much higher (less negative) log-likelihood.
+
+G2 here refers to the improvement in fit from the null model to the full model. The high result here indicates that the inclusion of predictors in the full model has substantially improved the model fit compared to the null model.
+
+McFadden's R-squared indicates that values between 0.2 and 0.4 are considered indicative of a good model fit. Here, 0.1747 suggests a moderate fit.
+
+Maximum likelihood R-squared adjusts for sample size and likelihood differences, and indicates that the model explains about 18.34% of the variance in the dependent variable.
+
+The Cragg-Uhler is a normalized pseudo-R², adjusting for the maximum possible R² value, which indicates that the model explains about 26.76% of the variance in the dependent variable.
+
+```{r}
+# Predict probabilities
+data_relevant$predicted_prob <- predict(model, type = "response")
+
+# Evaluate model performance using confusion matrix
+confusionMatrix(as.factor(ifelse(data_relevant$predicted_prob > 0.5, 1, 0)),
+                data_relevant$available_binary)
+```
+Confusion Matrix:
+- True Positives (TP): 117,665 — Cases where the model correctly predicted no availability.
+- True Negatives (TN): 15,718 — Cases where the model correctly predicted availability.
+- False Positives (FP): 9,240 — Cases where the model incorrectly predicted availability when there was none.
+- False Negatives (FN): 31,008 — Cases where the model incorrectly predicted no availability when there was availability.
+
+Model Performance:
+- Accuracy (proportion of total predictions that were correct): the model correctly classified 76.82% of the cases.
+- 95% Confidence Interval: The true accuracy of the model is expected to lie, with 95% confidence, between 76.6% and 77.0%.
+- No Information Rate: accuracy achieved by always predicting the majority class (no availability in shelter) along with the P-Value: This value states that the model’s accuracy is significantly better than the no-information rate.
+- Kappa (the agreement between actual and predicted values, adjusted for chance agreement ranged from -1 to 1): This result indicates moderate agreement between predictions and actual values. 
+
+Mcnemar's Test P-Value(whether the proportions of errors for each class (false positives vs. false negatives) are significantly different): The result ndicates a significant imbalance between false positives and false negatives.
+
+Sensitivity, specificity and predictive values
+- Sensitivity (true positive rate or recall for the majority class (0)): The model correctly identified 92.72% of the cases where there was no availability.
+- Specificity (true negative rate or recall for the minority class (1)): The model correctly identified 33.64% of the cases where there was availability, suggesting the model struggles with the minority class
+- Positive prediction value (precision for class 0 (no availability)): When the model predicts no availability, 79.14% of the time it is correct.
+- Negative prediction value (precision for class 1 (availability)): When the model predicts availability, 62.98% of the time it is correct.
+- Prevalence (proportion of the majority class (no availability) in the dataset): 73.1% of the dataset holds the majority value (no availability).
+- Detection rate (proportion of correctly identified cases of no availability in the total dataset): 67.8% of the correctly identified cases had no availability.
+- Detection prevalence (proportion of the predicted cases with no availability): 85.6% of the cases predicted showed no availability.
+- Balanced accuracy (average of the sensitivity and the accuracy): The overall accuracy of the model when accounting for imbalanced classes is 63.18%.
+
+
+Use the confusion matrix component to calculate the metrics
+```{r}
+# Classify predictions
+data_relevant$predicted_class <- ifelse(data_relevant$predicted_prob > 0.5, 1, 0)
+
+# Confusion matrix components
+TP <- sum(data_relevant$predicted_class == 1 & data_relevant$available_binary == 1)
+TN <- sum(data_relevant$predicted_class == 0 & data_relevant$available_binary == 0)
+FP <- sum(data_relevant$predicted_class == 1 & data_relevant$available_binary == 0)
+FN <- sum(data_relevant$predicted_class == 0 & data_relevant$available_binary == 1)
+
+# Accuracy
+accuracy <- (TP + TN) / (TP + TN + FP + FN)
+
+# Precision
+precision <- TP / (TP + FP)
+
+# Recall
+recall <- TP / (TP + FN)
+
+# F1 Score
+f1_score <- 2 * precision * recall / (precision + recall)
+
+# Display results
+metrics <- data.frame(
+  Metric = c("Accuracy", "Precision", "Recall", "F1 Score"),
+  Value = c(accuracy, precision, recall, f1_score)
+)
+print(metrics)
+```
+
+ADD COMMENTS TO THIS
+
+Calculate the VIF to check multi-collinearity
+```{r}
+vif(model)
+```
+AAD COMMENTS TO THIS.
+
+
+## INCLUDING IMMIGRATION
+```{r}
+immigration_data <- read_csv('raw-data/immigration_numbers_ontario.csv')
+```
+
+```{r}
+immigration_data <- immigration_data %>%
+  rename(year = 'Year', month = 'Month', immigration =  'Total Immigration') %>%
+  select(c(year,month,immigration))
+```
+
+
+merge
+```{r}
+data_imm <- data %>%
+  left_join(immigration_data, by = c("year", "month"))
+```
+
+```{r}
+data <- data_imm %>%
+  mutate(
+    CAPACITY_ACTUAL_ROOM = ceiling(replace(CAPACITY_ACTUAL_ROOM, is.na(CAPACITY_ACTUAL_ROOM), 0) * shelter_rooms_mean),
+    OCCUPIED_ROOMS = ceiling(replace(OCCUPIED_ROOMS, is.na(OCCUPIED_ROOMS), 0) * shelter_rooms_mean),
+    UNOCCUPIED_ROOMS = ceiling(replace(UNOCCUPIED_ROOMS, is.na(UNOCCUPIED_ROOMS), 0 * shelter_rooms_mean))
+  )
+
+data_filtered <- data %>%
+  mutate(
+    capacity_total = replace_na(CAPACITY_ACTUAL_BED, 0) + replace_na(CAPACITY_ACTUAL_ROOM, 0),
+    occupied_total = replace_na(OCCUPIED_BEDS, 0) + replace_na(OCCUPIED_ROOMS, 0),
+    availability_total = replace_na(UNOCCUPIED_BEDS, 0) + replace_na(UNOCCUPIED_ROOMS, 0),
+    available_binary = if_else(availability_total > 0, 1, 0),
+    availability_rate = availability_total / capacity_total
+  )
+
+data_relevant <- data_filtered %>%
+  select(c(date, available_binary, availability_total, availability_rate, capacity_total, SECTOR, HOOD_158, total_crime, cpi_all, unemployment_rate, min_temp_celsius, precip_cm, immigration)) %>%
+  rename(neighbourhood = HOOD_158,
+         sector = SECTOR)
+
+data_relevant <- data_relevant %>%
+  filter(availability_total >= 0,
+         !is.na(min_temp_celsius)) %>%
+  mutate(unemployment_rate = unemployment_rate * 100) %>%
+  filter(!is.na(im))
+
+colSums(is.na(data_relevant))
+
+data_relevant <- data_relevant %>%
+  mutate(
+    sector = factor(sector),
+    neighbourhood = factor(neighbourhood),
+    available_binary = as.factor(available_binary) # Dependent variable as a factor
+  )
+
+data_relevant$neighbourhood <- relevel(factor(data_relevant$neighbourhood), ref = "172")
+
+model <- glm(
+  available_binary ~ capacity_total + sector + neighbourhood + 
+    total_crime + cpi_all + unemployment_rate + min_temp_celsius + precip_cm + immigration,
+  data = data_relevant,
+  family = binomial
+)
+
+summary(model)
+
+# Extract model summary
+summary_model <- summary(model)
+
+# Create a dataframe with coefficients, standard errors, z-values, and p-values
+summary_df <- as.data.frame(summary_model$coefficients)
+
+# Rename columns for clarity
+colnames(summary_df) <- c("Estimate", "Std_Error", "Z_value", "P_value")
+
+# Add exponentiated odds ratios (exp(coef))
+summary_df$Odds_Ratio <- exp(coef(model))
+
+# Round values for readability
+summary_df <- summary_df %>%
+  mutate(across(c(Estimate, Std_Error, Z_value, P_value, Odds_Ratio), ~ round(., 3)))
+
+# View the resulting dataframe
+summary_df
+
+# Null model (intercept only)
+null_model <- glm(
+  available_binary ~ 1,
+  data = data_relevant,
+  family = binomial
+)
+
+lrt <- anova(null_model, model, test = "Chisq")
+print(lrt)
+
+pR2(model)
+
+# Predict probabilities
+data_relevant$predicted_prob <- predict(model, type = "response")
+
+# Evaluate model performance using confusion matrix
+confusionMatrix(as.factor(ifelse(data_relevant$predicted_prob > 0.5, 1, 0)),
+                data_relevant$available_binary)
+
+# Classify predictions
+data_relevant$predicted_class <- ifelse(data_relevant$predicted_prob > 0.5, 1, 0)
+
+# Confusion matrix components
+TP <- sum(data_relevant$predicted_class == 1 & data_relevant$available_binary == 1)
+TN <- sum(data_relevant$predicted_class == 0 & data_relevant$available_binary == 0)
+FP <- sum(data_relevant$predicted_class == 1 & data_relevant$available_binary == 0)
+FN <- sum(data_relevant$predicted_class == 0 & data_relevant$available_binary == 1)
+
+# Accuracy
+accuracy <- (TP + TN) / (TP + TN + FP + FN)
+
+# Precision
+precision <- TP / (TP + FP)
+
+# Recall
+recall <- TP / (TP + FN)
+
+# F1 Score
+f1_score <- 2 * precision * recall / (precision + recall)
+
+# Display results
+metrics <- data.frame(
+  Metric = c("Accuracy", "Precision", "Recall", "F1 Score"),
+  Value = c(accuracy, precision, recall, f1_score)
+)
+print(metrics)
+```
+
+```{r}
+vif(model)
+```
+```{r}
+pR2(model)
+```
+

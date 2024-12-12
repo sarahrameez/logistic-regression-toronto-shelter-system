@@ -1,0 +1,291 @@
+---
+title: "Logistic Regression with log normals"
+author: "Sarah Rameez"
+date: "2024-11-29"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Logistic Regression
+
+### Load the Libraries
+```{r}
+library(dplyr)
+library(tidyr)
+library(tidyverse)
+library(ggplot2)
+library(lubridate)
+library(stringr)
+library(reshape2)
+library(pscl)
+library(caret)
+library(effects)
+library(car)
+```
+
+### Load the Data
+```{r}
+data <- read_csv('merged-data.csv')
+```
+
+
+```{r}
+# load the manually inserted data
+shelter_rooms <- read_csv('raw-data/shelter-room-beds.csv')
+shelter_rooms_mean <- mean(shelter_rooms$`Beds per room`, na.rm = TRUE)
+```
+
+Now that we have the average number of rooms, we apply it to the dataframe for all room-based capacity types:
+```{r}
+# replace NA values with 0 for room based capacity and occupancy
+data <- data %>%
+  mutate(
+    CAPACITY_ACTUAL_ROOM = ceiling(replace(CAPACITY_ACTUAL_ROOM, is.na(CAPACITY_ACTUAL_ROOM), 0) * shelter_rooms_mean),
+    OCCUPIED_ROOMS = ceiling(replace(OCCUPIED_ROOMS, is.na(OCCUPIED_ROOMS), 0) * shelter_rooms_mean),
+    UNOCCUPIED_ROOMS = ceiling(replace(UNOCCUPIED_ROOMS, is.na(UNOCCUPIED_ROOMS), 0 * shelter_rooms_mean))
+  )
+```
+
+
+```{r}
+# combine the updated capacities and occupancies
+data_filtered <- data %>%
+  mutate(
+    capacity_total = replace_na(CAPACITY_ACTUAL_BED, 0) + replace_na(CAPACITY_ACTUAL_ROOM, 0),
+    occupied_total = replace_na(OCCUPIED_BEDS, 0) + replace_na(OCCUPIED_ROOMS, 0),
+    availability_total = replace_na(UNOCCUPIED_BEDS, 0) + replace_na(UNOCCUPIED_ROOMS, 0),
+    available_binary = if_else(availability_total > 0, 1, 0),
+    availability_rate = availability_total / capacity_total
+  )
+```
+
+#### Remove unnecessary variables
+```{r}
+data_relevant <- data_filtered %>%
+  select(c(date, available_binary, availability_total, availability_rate, capacity_total, SECTOR, HOOD_158, total_crime, cpi_all, unemployment_rate, min_temp_celsius, precip_cm)) %>%
+  rename(neighbourhood = HOOD_158,
+         sector = SECTOR)
+```
+
+#### Check for NA values
+```{r}
+colSums(is.na(data_relevant))
+
+summary(data_relevant)
+```
+Confirmed that no value is NA. However from the summary I can see a few availability total values are -1, so will be cleaning (removing) those.
+
+```{r}
+data_relevant <- data_relevant %>%
+  filter(availability_total >= 0,
+         !is.na(min_temp_celsius)) %>%
+  mutate(unemployment_rate = unemployment_rate * 100) # multiplying unemployment rate by 100 is re-scaling
+
+colSums(is.na(data_relevant))
+```
+
+Convert Categorical Variables to Factor
+```{r}
+# ensure categorical variables are factors
+data_relevant <- data_relevant %>%
+  mutate(
+    sector = factor(sector),
+    neighbourhood = factor(neighbourhood),
+    available_binary = as.factor(available_binary) # Dependent variable as a factor
+  )
+
+summary(data_relevant)
+```
+
+## Exploratory Analysis
+Plot histograms of numeric variables for each day
+```{r}
+data_relevant_long <- data_relevant %>%
+  pivot_longer(
+    cols = c(capacity_total, total_crime, cpi_all, unemployment_rate, min_temp_celsius, precip_cm),
+    names_to = "variable",
+    values_to = "value"
+  )
+
+ggplot(data = data_relevant_long, mapping = aes(x = value)) +
+  geom_histogram(bins = 10, fill = "steelblue", color = "black") +
+  facet_wrap(~ variable, scales = "free", ncol = 3) +
+  theme_minimal() +
+  labs(title = "Histograms of Numerical Variables Before Log Transformation",
+       x = "Value",
+       y = "Frequency")
+```
+
+## LOG NORMAL INDEPENDENT VARIABLES
+```{r}
+# Add a small constant (1) to avoid log(0) issues
+data_log_normalized <- data_relevant %>%
+  mutate(capacity_total = log(capacity_total),
+         cpi_all = log(cpi_all),
+         precip_cm = log(precip_cm),
+         total_crime = log(total_crime),
+         unemployment_rate = log(unemployment_rate))
+
+# Plot histogram before and after log transformation
+data_relevant_long <- data_log_normalized %>%
+  pivot_longer(
+    cols = c(capacity_total, total_crime, cpi_all, unemployment_rate, min_temp_celsius, precip_cm),
+    names_to = "variable",
+    values_to = "value"
+  )
+
+ggplot(data = data_relevant_long, mapping = aes(x = value)) +
+  geom_histogram(bins = 10, fill = "steelblue", color = "black") +
+  facet_wrap(~ variable, scales = "free", ncol = 3) +
+  theme_minimal() +
+  labs(title = "Histograms of Numerical Variables After Log Transformation",
+       x = "Value",
+       y = "Frequency")
+```
+
+```{r}
+colSums(is.na(data_log_normalized))
+
+sapply(data_log_normalized, class)
+```
+
+```{r}
+data_clean <- data_log_normalized %>%
+  filter(
+    !is.na(available_binary) & 
+    !is.na(capacity_total) & 
+    !is.na(sector) & 
+    !is.na(neighbourhood) & 
+    !is.na(total_crime) & 
+    !is.na(cpi_all) & 
+    !is.na(unemployment_rate) & 
+    !is.na(min_temp_celsius) & 
+    !is.na(precip_cm)
+  )
+
+data_clean <- data_clean %>%
+  filter_all(all_vars(is.finite(.))) # Keep only finite rows
+```
+
+
+# MODEL AND INTERPRETATIONS
+Build the initial model based on initial selection of variables:
+
+Fit the model, and calculate odds ratio:
+```{r}
+# set baseline to a neighbourhood with an average number of shelters 
+data_clean$neighbourhood <- relevel(factor(data_clean$neighbourhood), ref = "172")
+
+model <- glm(
+  available_binary ~ capacity_total + sector + neighbourhood + 
+    total_crime + cpi_all + unemployment_rate + min_temp_celsius + precip_cm,
+  data = data_clean,
+  family = binomial
+)
+
+summary(model)
+```
+
+Create Model Summary
+```{r}
+# Extract model summary
+summary_model <- summary(model)
+
+# Create a dataframe with coefficients, standard errors, z-values, and p-values
+summary_df <- as.data.frame(summary_model$coefficients)
+
+# Rename columns for clarity
+colnames(summary_df) <- c("Estimate", "Std_Error", "Z_value", "P_value")
+
+# Add exponentiated odds ratios (exp(coef))
+summary_df$Odds_Ratio <- exp(coef(model))
+
+# Round values for readability
+summary_df <- summary_df %>%
+  mutate(
+    Estimate = round(Estimate, 3),
+    Std_Error = round(Std_Error, 3),
+    Z_value = round(Z_value, 3),
+    P_value = round(P_value, 3),
+    Odds_Ratio = round(Odds_Ratio, 3) # Round Odds Ratio to 4 decimal places
+  )
+
+# View the resulting dataframe
+print(summary_df)
+
+write.csv(summary_df, 'summary.csv', row.names= TRUE)
+```
+
+# ASSESSMENT
+Check overall model fit using Likelihood Test Ratio
+```{r}
+# Null model (intercept only)
+null_model <- glm(
+  available_binary ~ 1,
+  data = data_clean,
+  family = binomial
+)
+
+lrt <- anova(null_model, model, test = "Chisq")
+print(lrt)
+```
+
+Assess model fit and predictive power
+```{r}
+# Calculate pseudo R-squared
+pR2(model)
+```
+
+```{r}
+# Predict probabilities
+data_clean$predicted_prob <- predict(model, type = "response")
+
+# Evaluate model performance using confusion matrix
+confusionMatrix(as.factor(ifelse(data_clean$predicted_prob > 0.5, 1, 0)),
+                data_clean$available_binary)
+```
+
+Use the confusion matrix component to calculate the metrics
+```{r}
+# Classify predictions
+data_clean$predicted_class <- ifelse(data_clean$predicted_prob > 0.5, 1, 0)
+
+# Confusion matrix components
+TP <- sum(data_clean$predicted_class == 1 & data_clean$available_binary == 1)
+TN <- sum(data_clean$predicted_class == 0 & data_clean$available_binary == 0)
+FP <- sum(data_clean$predicted_class == 1 & data_clean$available_binary == 0)
+FN <- sum(data_clean$predicted_class == 0 & data_clean$available_binary == 1)
+
+# Accuracy
+accuracy <- (TP + TN) / (TP + TN + FP + FN)
+
+# Precision
+precision <- TP / (TP + FP)
+
+# Recall
+recall <- TP / (TP + FN)
+
+# F1 Score
+f1_score <- 2 * precision * recall / (precision + recall)
+
+# Display results
+metrics <- data.frame(
+  Metric = c("Accuracy", "Precision", "Recall", "F1 Score"),
+  Value = c(accuracy, precision, recall, f1_score)
+)
+print(metrics)
+```
+
+Calculate the VIF to check multi-collinearity
+```{r}
+vif(model)
+```
+
+```{r}
+unique_count <- n_distinct(data$SHELTER_ID)
+print(unique_count)
+```
+
